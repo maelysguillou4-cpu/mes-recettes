@@ -51,37 +51,61 @@ module.exports = async (req, res) => {
     "et les étapes courtes dans l'ordre, sans numérotation. " +
     "Si le texte ne contient pas de recette, renvoie un titre vide et des listes vides.";
 
-  let out;
-  try {
-    const g = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: instruction }] },
-        contents: [{ role: "user", parts: [{ text: input }] }],
-        generationConfig: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: "OBJECT",
-            properties: {
-              title: { type: "STRING" },
-              ingredients: { type: "ARRAY", items: { type: "STRING" } },
-              steps: { type: "ARRAY", items: { type: "STRING" } },
-            },
-            required: ["title", "ingredients", "steps"],
-          },
+  // On essaie plusieurs modèles à la suite : si l'un est surchargé (503) ou introuvable, on passe au suivant.
+  const models = [...new Set([
+    process.env.GEMINI_MODEL,
+    "gemini-flash-lite-latest",
+    "gemini-flash-latest",
+    "gemini-2.5-flash-lite",
+  ].filter(Boolean))];
+
+  const body = JSON.stringify({
+    systemInstruction: { parts: [{ text: instruction }] },
+    contents: [{ role: "user", parts: [{ text: input }] }],
+    generationConfig: {
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: "OBJECT",
+        properties: {
+          title: { type: "STRING" },
+          ingredients: { type: "ARRAY", items: { type: "STRING" } },
+          steps: { type: "ARRAY", items: { type: "STRING" } },
         },
-      }),
-    });
-    if (!g.ok) {
-      console.error("Erreur Gemini", g.status, await g.text());
-      return res.status(502).json({ error: "L’IA n’a pas répondu (limite gratuite atteinte ou modèle indisponible). Réessaie dans un moment." });
+        required: ["title", "ingredients", "steps"],
+      },
+    },
+  });
+
+  let out = null;
+  let overloaded = false;
+  for (const model of models) {
+    try {
+      const g = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY },
+        body,
+        signal: AbortSignal.timeout(8000),
+      });
+      if (!g.ok) {
+        console.error("Erreur Gemini", model, g.status, await g.text());
+        if (g.status === 503 || g.status === 429 || g.status === 500) overloaded = true;
+        await new Promise((r) => setTimeout(r, 600));
+        continue; // on tente le modèle suivant
+      }
+      const data = await g.json();
+      out = JSON.parse(data.candidates[0].content.parts[0].text);
+      break;
+    } catch (e) {
+      console.error("Échec avec", model, e.message);
     }
-    const data = await g.json();
-    out = JSON.parse(data.candidates[0].content.parts[0].text);
-  } catch (e) {
-    console.error(e);
-    return res.status(502).json({ error: "Réponse de l’IA illisible. Réessaie." });
+  }
+
+  if (!out) {
+    return res.status(502).json({
+      error: overloaded
+        ? "Les serveurs de l’IA sont très sollicités en ce moment. Réessaie dans une minute."
+        : "L’IA n’a pas répondu. Vérifie ta clé Google et le nom du modèle dans Vercel, puis réessaie.",
+    });
   }
 
   if (!out.ingredients.length && !out.steps.length) {
