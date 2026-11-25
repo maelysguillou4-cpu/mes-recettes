@@ -20,8 +20,37 @@ module.exports = async (req, res) => {
   let input = String((req.body && req.body.input) || "").trim();
   if (!input) return res.status(400).json({ error: "Rien à analyser." });
 
-  // Si c'est un lien, on lit la page (données structurées + texte visible).
+  // Liens de réseaux sociaux : traitement spécial selon le site.
+  let videoParts = null; // pour YouTube : l'IA regarde la vidéo elle-même
+  let handled = false;
   if (/^https?:\/\/\S+$/i.test(input)) {
+    let host = "";
+    try { host = new URL(input).hostname.replace(/^www\./, ""); } catch {}
+    if (/(^|\.)instagram\.com$/.test(host)) {
+      return res.status(422).json({
+        error: "Instagram bloque la lecture automatique. Copie la légende de la publication et colle-la ici.",
+      });
+    } else if (/(^|\.)(youtube\.com|youtu\.be)$/.test(host)) {
+      videoParts = [{ fileData: { fileUri: input } }, { text: "Extrais la recette de cette vidéo." }];
+      handled = true;
+    } else if (/(^|\.)tiktok\.com$/.test(host)) {
+      try {
+        const final = (await fetch(input, { redirect: "follow", signal: AbortSignal.timeout(8000) })).url.split("?")[0];
+        const o = await fetch("https://www.tiktok.com/oembed?url=" + encodeURIComponent(final), { signal: AbortSignal.timeout(8000) });
+        const j = await o.json();
+        if (!j.title) throw new Error("légende vide");
+        input = `Légende d’une vidéo TikTok de ${j.author_name || "l’auteur"} :\n${j.title}`;
+        handled = true;
+      } catch (e) {
+        return res.status(422).json({
+          error: "Impossible de lire cette vidéo TikTok. Copie la légende et colle-la ici.",
+        });
+      }
+    }
+  }
+
+  // Si c'est un lien, on lit la page (données structurées + texte visible).
+  if (!handled && /^https?:\/\/\S+$/i.test(input)) {
     try {
       const page = await fetch(input, {
         headers: { "User-Agent": "Mozilla/5.0 (compatible; RecettesPerso/1.0)", "Accept-Language": "fr,en;q=0.8" },
@@ -61,7 +90,7 @@ module.exports = async (req, res) => {
 
   const body = JSON.stringify({
     systemInstruction: { parts: [{ text: instruction }] },
-    contents: [{ role: "user", parts: [{ text: input }] }],
+    contents: [{ role: "user", parts: videoParts || [{ text: input }] }],
     generationConfig: {
       responseMimeType: "application/json",
       responseSchema: {
